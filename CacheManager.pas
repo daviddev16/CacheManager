@@ -70,6 +70,7 @@ type
       procedure Put<V>(const Section, Key: String; const ExpiresInMillis: Int64; const Value: V); overload;
       function GetOrMiss<V>(const Section, Key: String; out Value: V): Boolean; overload;
       procedure Invalidate(const Section: String); overload;
+      procedure InvalidateAll();
     public
       constructor Create(const OwnsValues: Boolean;
                          const DefaultExpiresInMillis: Int64 = -1);
@@ -91,6 +92,7 @@ type
       class procedure Put<V>(const Section, Key: String; const ExpiresInMillis: Int64; const Value: V); overload;
       class function GetOrMiss<V>(const Section, Key: String; out Value: V): Boolean; overload;
       class procedure Invalidate(const Section: String); overload;
+      class procedure InvalidateAll();
     public
       class constructor Initialize();
       class destructor Unitialize();
@@ -319,6 +321,12 @@ begin
   FSections[lSectionIndex].Invalidate();
 end;
 
+procedure TSectionCacheTable.InvalidateAll();
+begin
+  for var I := 0 to FSectionsCount - 1 do
+    FSections[I].Invalidate();
+end;
+
 procedure TSectionCacheTable.Invalidate();
 begin
   FSections[0].Invalidate();
@@ -426,6 +434,11 @@ class procedure TCacheManager.Invalidate(
   const Section: String);
 begin
   FGlobalCacheTable.Invalidate(Section);
+end;
+
+class procedure TCacheManager.InvalidateAll();
+begin
+  FGlobalCacheTable.InvalidateAll();
 end;
 
 class procedure TCacheManager.Put<V>(
