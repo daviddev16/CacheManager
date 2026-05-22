@@ -182,7 +182,6 @@ procedure TCacheTable.Put<V>(
   const ExpiresInMillis: Int64;
   const Value: V);
 var
-  lElderKey: String;
   lValueNode: PValueNode;
   lExpiresInMillis: Integer;
   lValue: TValue;
@@ -230,7 +229,6 @@ begin
     if not FCacheDictionary.TryGetValue(Key, lValueNode) then
     begin
       Value := Default(V);
-      Result := False;
       Exit;
     end;
 
@@ -248,12 +246,7 @@ begin
   FRWSync.BeginWrite();
   try
     if FCacheDictionary.TryGetValue(Key, lValueNode) then
-    begin
-      FCacheLinkedList.RemoveNode(lValueNode);
-      FCacheDictionary.Remove(Key);
-      Result := False;
-      Exit;
-    end;
+      HandleUnsafeRemove(lValueNode);
   finally
     FRWSync.EndWrite();
   end;
@@ -276,8 +269,10 @@ procedure TCacheTable.EvictAll();
 begin
   FRWSync.BeginWrite();
   try
-    FCacheLinkedList.Clear();
     FCacheDictionary.Clear();
+    // TDoublyLinkedList clear the PValueNode from
+    // memory.
+    FCacheLinkedList.Clear();
   finally
     FRWSync.EndWrite();
   end;
