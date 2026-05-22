@@ -88,7 +88,7 @@ type
           procedure MoveToFront(const ValueNode: PValueNode);
           procedure AddToFront(const ValueNode: PValueNode);
           procedure RemoveNode(const ValueNode: PValueNode);
-          function RemoveEldest(out Key: String): Boolean;
+          function TryGetEldestNode(out ValueNode: PValueNode): Boolean;
         public
           constructor Create();
           destructor Destroy(); override;
@@ -210,8 +210,8 @@ begin
 
     if FCacheDictionary.Count > FCapacity then
     begin
-      if FCacheLinkedList.RemoveEldest(lElderKey) then
-        FCacheDictionary.Remove(lElderKey);
+      if FCacheLinkedList.TryGetEldestNode(lValueNode) then
+        HandleUnsafeRemove(lValueNode);
     end;
   finally
     FRWSync.EndWrite();
@@ -474,24 +474,17 @@ begin
   AddToFront(ValueNode);
 end;
 
-function TCacheTable.TDoublyLinkedList.RemoveEldest(
-  out Key: String): Boolean;
-var
-  lValueNode: PValueNode;
+function TCacheTable.TDoublyLinkedList.TryGetEldestNode(
+  out ValueNode: PValueNode): Boolean;
 begin
-  Key := EmptyStr;
-
   if FTail = nil then
   begin
     Result := False;
+    ValueNode := nil;
     Exit;
   end;
 
-  lValueNode := FTail;
-  RemoveNode(lValueNode);
-
-  Key := lValueNode.Key;
-  Dispose(lValueNode);
+  ValueNode := FTail;
   Result := True;
 end;
 
