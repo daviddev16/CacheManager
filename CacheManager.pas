@@ -13,86 +13,141 @@ uses
   System.Generics.Collections;
 
 type
-  TCacheTable = class
-    private type
-      TCacheValue = class
+  ECacheException = class(Exception);
+
+  //
+  // Record used to store the cache key-value
+  // information.
+  //
+  PValueNode = ^TValueNode;
+
+  TValueNode = record
+    strict private
+      FValue: TValue;
+      FStopwatch: TStopwatch;
+      FExpiresInMillis: Int64;
+      FKey: String;
+    private
+      Next: PValueNode;
+      Previous: PValueNode;
+    strict private
+      function GetElapsedMillis(): Int64;
+      procedure CheckSupportedTypeInfo(const TypeInfo: PTypeInfo);
+    public
+      function AsValue<V>(): V;
+      procedure Initialize(const Key: String;
+                           const Value: TValue;
+                           const ExpiresInMillis: Int64);
+    public
+      property ExpiresInMillis: Int64 read FExpiresInMillis;
+      property ElapsedMillis: Int64 read GetElapsedMillis;
+      property Key: String read FKey;
+    end;
+
+  //
+  // Enumeration helper types
+  //
+  TCacheValue = packed record
+    strict private
+      FValueNode: PValueNode;
+    public
+      function AsValue<V>(): V;
+  private
+    function GetValueNodePointer: PValueNode;
+    public
+      class function From(const ValueNode: PValueNode): TCacheValue; static;
+    end;
+
+  TCachePair = record
+    strict private
+      FKey: String;
+      FValue: TCacheValue;
+    public
+      property Key: String read FKey;
+      property Value: TCacheValue read FValue;
+    public
+      class function WithPair(const Pair: TPair<String, PValueNode>): TCachePair; static;
+    end;
+
+  //
+  // TCacheTable implements a LRU cache mechanism using TDoublyLinkedList
+  // along with TDictionary to make O(1) operations while mainting the
+  // capacity correct.
+  //
+  TCacheTable = class(TEnumerable<TCachePair>)
+    strict private type
+      //
+      // This class does not lock anything. It should be used internally
+      // with the IReadWriteSync synchronization blocks.
+      //
+      TDoublyLinkedList = class
+        strict private
+          FHead, FTail: PValueNode;
         private
-          FValue: TValue;
-          FStopwatch: TStopwatch;
-          FExpiresInMillis: Int64;
-          FOwnsValues: Boolean;
-        private
-          function GetElapsedMillis(): Int64;
+          procedure Clear();
+          procedure MoveToFront(const ValueNode: PValueNode);
+          procedure AddToFront(const ValueNode: PValueNode);
+          procedure RemoveNode(const ValueNode: PValueNode);
+          function RemoveEldest(out Key: String): Boolean;
         public
-          function ResolveValue<V>(): V;
-          constructor Create(const Value: TValue;
-                             const ExpiresInMillis: Int64;
-                             const OwnsValues: Boolean);
+          constructor Create();
+          destructor Destroy(); override;
+        end;
+    private type
+      TCachePairEnumerator = class sealed(TEnumerator<TCachePair>)
+        private
+          FOwner: TCacheTable;
+          FEnumerator: TEnumerator<TPair<String, PValueNode>>;
+          function GetCurrent(): TCachePair;
+        protected
+          function DoGetCurrent(): TCachePair; override;
+          function DoMoveNext(): Boolean; override;
+        public
+          constructor Create(Owner: TCacheTable);
           destructor Destroy(); override;
         public
-          property ExpiresInMillis: Int64 read FExpiresInMillis;
-          property ElapsedMillis: Int64 read GetElapsedMillis;
-        end;
-    strict private
+          property Current: TCachePair read GetCurrent;
+          function MoveNext: Boolean;
+      end;
+    private
       FRWSync: IReadWriteSync;
-      FOwnsValues: Boolean;
       FDefaultExpiresInMillis: Int64;
-      FCacheDictionary: TDictionary<String, TCacheValue>;
+      FCacheDictionary: TDictionary<String, PValueNode>;
+      FCacheLinkedList: TDoublyLinkedList;
+      FCapacity: Integer;
+    private
+      //
+      // Unsafe here means it interacts with internal structures
+      // without locking.
+      //
+      procedure HandleUnsafePut(const ValueNode: PValueNode);
+      procedure HandleUnsafeRemove(var ValueNode: PValueNode);
+    protected
+      function GetCount(): Integer;
+      function DoGetEnumerator(): TEnumerator<TCachePair>; override;
     public
+      procedure EvictAll();
       procedure Evict(const Key: String);
       procedure Put<V>(const Key: String; const Value: V); overload;
       procedure Put<V>(const Key: String; const ExpiresInMillis: Int64; const Value: V); overload;
       function GetOrMiss<V>(const Key: String; out Value: V): Boolean;
-      procedure Invalidate();
     public
-      constructor Create(const OwnsValues: Boolean;
+      constructor Create(const Capacity: Integer;
                          const DefaultExpiresInMillis: Int64 = -1);
       destructor Destroy(); override;
-    end;
-
-  TSectionCacheTable = class
-    private const
-      AVAILABLE_SECTIONS = 32;
-    strict private
-      FSections: TArray<TCacheTable>;
-      FSectionsCount: Integer;
-    private
-      function GetSectionIndex(const Section: String): Integer; inline;
-    public // general cache section
-      procedure Evict(const Key: String); overload;
-      procedure Put<V>(const Key: String; const Value: V); overload;
-      procedure Put<V>(const Key: String; const ExpiresInMillis: Int64; const Value: V); overload;
-      function GetOrMiss<V>(const Key: String; out Value: V): Boolean; overload;
-      procedure Invalidate(); overload;
-    public // cache per section
-      procedure Evict(const Section, Key: String); overload;
-      procedure Put<V>(const Section, Key: String; const Value: V); overload;
-      procedure Put<V>(const Section, Key: String; const ExpiresInMillis: Int64; const Value: V); overload;
-      function GetOrMiss<V>(const Section, Key: String; out Value: V): Boolean; overload;
-      procedure Invalidate(const Section: String); overload;
-      procedure InvalidateAll();
     public
-      constructor Create(const OwnsValues: Boolean;
-                         const DefaultExpiresInMillis: Int64 = -1);
-      destructor Destroy(); override;
+      property Count: Integer read GetCount;
     end;
 
   TCacheManager = class sealed
     strict private
-      class var FGlobalCacheTable: TSectionCacheTable;
-    public // general cache section
-      class procedure Evict(const Key: String); overload;
+      class var GlobalCacheTable: TCacheTable;
+    public
+      class procedure EvictAll();
+      class procedure Evict(const Key: String);
       class procedure Put<V>(const Key: String; const Value: V); overload;
       class procedure Put<V>(const Key: String; const ExpiresInMillis: Int64; const Value: V); overload;
       class function GetOrMiss<V>(const Key: String; out Value: V): Boolean; overload;
-      class procedure Invalidate(); overload;
-    public // cache per section
-      class procedure Evict(const Section, Key: String); overload;
-      class procedure Put<V>(const Section, Key: String; const Value: V); overload;
-      class procedure Put<V>(const Section, Key: String; const ExpiresInMillis: Int64; const Value: V); overload;
-      class function GetOrMiss<V>(const Section, Key: String; out Value: V): Boolean; overload;
-      class procedure Invalidate(const Section: String); overload;
-      class procedure InvalidateAll();
     public
       class constructor Initialize();
       class destructor Unitialize();
@@ -100,16 +155,19 @@ type
 
 implementation
 
-{ TCacheTable }
+{$Region 'TCacheTable' }
 
 constructor TCacheTable.Create(
-  const OwnsValues: Boolean;
+  const Capacity: Integer;
   const DefaultExpiresInMillis: Int64 = -1);
 begin
-  FOwnsValues := OwnsValues;
+  FCapacity := Capacity;
+  Assert(FCapacity >= 1, 'Capacity must be equals or greater than 1.');
+
   FDefaultExpiresInMillis := DefaultExpiresInMillis;
   FRWSync := TMultiReadExclusiveWriteSynchronizer.Create();
-  FCacheDictionary := TObjectDictionary<String, TCacheValue>.Create([doOwnsValues]);
+  FCacheLinkedList := TDoublyLinkedList.Create();
+  FCacheDictionary := TDictionary<String, PValueNode>.Create(FCapacity + 1);
 end;
 
 procedure TCacheTable.Put<V>(
@@ -124,21 +182,37 @@ procedure TCacheTable.Put<V>(
   const ExpiresInMillis: Int64;
   const Value: V);
 var
-  lCacheValue: TCacheValue;
+  lElderKey: String;
+  lValueNode: PValueNode;
   lExpiresInMillis: Integer;
+  lValue: TValue;
 begin
+  lValueNode := nil;
   lExpiresInMillis := FDefaultExpiresInMillis;
+
+  if ExpiresInMillis <> -1 then
+    lExpiresInMillis := ExpiresInMillis;
+
   FRWSync.BeginWrite();
   try
-    if ExpiresInMillis <> -1 then
-      lExpiresInMillis := ExpiresInMillis;
+    //
+    // If i'm replacing the value, the previous node should
+    // be destroyed appropriately.
+    //
+    if FCacheDictionary.TryGetValue(Key, lValueNode) then
+      HandleUnsafeRemove(lValueNode);
 
-    lCacheValue := TCacheValue.Create(
-        TValue.From<V>(Value),
-        lExpiresInMillis,
-        FOwnsValues);
+    lValue := TValue.From<V>(Value);
 
-    FCacheDictionary.AddOrSetValue(Key, lCacheValue);
+    New(lValueNode);
+    lValueNode.Initialize(Key, lValue, lExpiresInMillis);
+    HandleUnsafePut(lValueNode);
+
+    if FCacheDictionary.Count > FCapacity then
+    begin
+      if FCacheLinkedList.RemoveEldest(lElderKey) then
+        FCacheDictionary.Remove(lElderKey);
+    end;
   finally
     FRWSync.EndWrite();
   end;
@@ -148,21 +222,22 @@ function TCacheTable.GetOrMiss<V>(
   const Key: String;
   out Value: V): Boolean;
 var
-  lCacheValue: TCacheValue;
+  lValueNode: PValueNode;
 begin
   Result := False;
   FRWSync.BeginRead();
   try
-    if not FCacheDictionary.TryGetValue(Key, lCacheValue) then
+    if not FCacheDictionary.TryGetValue(Key, lValueNode) then
     begin
       Value := Default(V);
       Result := False;
       Exit;
     end;
 
-    if lCacheValue.ElapsedMillis < lCacheValue.ExpiresInMillis then
+    if lValueNode.ElapsedMillis < lValueNode.ExpiresInMillis then
     begin
-      Value := lCacheValue.ResolveValue<V>();
+      FCacheLinkedList.MoveToFront(lValueNode);
+      Value := lValueNode.AsValue<V>();
       Result := True;
       Exit;
     end;
@@ -172,8 +247,9 @@ begin
 
   FRWSync.BeginWrite();
   try
-    if FCacheDictionary.TryGetValue(Key, lCacheValue) then
+    if FCacheDictionary.TryGetValue(Key, lValueNode) then
     begin
+      FCacheLinkedList.RemoveNode(lValueNode);
       FCacheDictionary.Remove(Key);
       Result := False;
       Exit;
@@ -184,61 +260,97 @@ begin
 end;
 
 procedure TCacheTable.Evict(const Key: String);
+var
+  lValueNode: PValueNode;
 begin
   FRWSync.BeginWrite();
   try
-    FCacheDictionary.Remove(Key);
+    if FCacheDictionary.TryGetValue(Key, lValueNode) then
+      HandleUnsafeRemove(lValueNode);
   finally
     FRWSync.EndWrite();
   end;
 end;
 
-procedure TCacheTable.Invalidate();
+procedure TCacheTable.EvictAll();
 begin
   FRWSync.BeginWrite();
   try
+    FCacheLinkedList.Clear();
     FCacheDictionary.Clear();
   finally
     FRWSync.EndWrite();
   end;
 end;
 
+function TCacheTable.GetCount(): Integer;
+begin
+  FRWSync.BeginRead();
+  try
+    Result := FCacheDictionary.Count;
+  finally
+    FRWSync.EndRead();
+  end;
+end;
+
+function TCacheTable.DoGetEnumerator(): TEnumerator<TCachePair>;
+begin
+  Result := TCachePairEnumerator.Create(Self);
+end;
+
+procedure TCacheTable.HandleUnsafePut(const ValueNode: PValueNode);
+begin
+  FCacheDictionary.Add(ValueNode.Key, ValueNode);
+  FCacheLinkedList.AddToFront(ValueNode);
+end;
+
+procedure TCacheTable.HandleUnsafeRemove(var ValueNode: PValueNode);
+begin
+  FCacheDictionary.Remove(ValueNode.Key);
+  FCacheLinkedList.RemoveNode(ValueNode);
+  Dispose(ValueNode);
+  ValueNode := nil;
+end;
+
 destructor TCacheTable.Destroy();
 begin
-  Invalidate();
-  FRWSync := nil;
+  EvictAll();
   FCacheDictionary.Free();
+  FCacheLinkedList.Free();
+  FRWSync := nil;
   inherited;
 end;
 
-{ TCacheTable.TCacheValue }
+{$EndRegion 'TCacheTable' }
 
-constructor TCacheTable.TCacheValue.Create(
+{$Region 'TValueNode' }
+
+procedure TValueNode.Initialize(
+  const Key: String;
   const Value: TValue;
-  const ExpiresInMillis: Int64;
-  const OwnsValues: Boolean);
+  const ExpiresInMillis: Int64);
 begin
+  FKey := Key;
   FValue := Value;
-  FOwnsValues := OwnsValues;
 
+  FExpiresInMillis := ExpiresInMillis;
   if FExpiresInMillis <> -1 then
     FStopwatch := TStopwatch.StartNew();
 
-  FExpiresInMillis := ExpiresInMillis;
+  Next := nil;
+  Previous := nil;
 end;
 
-function TCacheTable.TCacheValue.GetElapsedMillis(): Int64;
-begin
-  Result := FStopwatch.ElapsedMilliseconds;
-end;
-
-function TCacheTable.TCacheValue.ResolveValue<V>(): V;
+function TValueNode.AsValue<V>(): V;
 var
   lValue: TValue;
   lVTypeInfo: PTypeInfo;
 begin
-  lValue := FValue;
   lVTypeInfo := TypeInfo(V);
+
+  CheckSupportedTypeInfo(lVTypeInfo);
+
+  lValue := FValue;
 
   if (FValue.IsEmpty) or (lVTypeInfo = nil) then
   begin
@@ -252,193 +364,46 @@ begin
   Result := lValue.AsType<V>();
 end;
 
-destructor TCacheTable.TCacheValue.Destroy();
-var
-  lObject: TObject;
+function TValueNode.GetElapsedMillis(): Int64;
 begin
-  FStopwatch.Stop();
-
-  if (not FOwnsValues) or (FValue.IsEmpty) then
-    Exit;
-
-  if FValue.Kind = tkClass then
-  begin
-    lObject := FValue.AsObject;
-    if Assigned(lObject) then
-      lObject.Free();
-  end;
-
-  inherited;
+  Result := FStopwatch.ElapsedMilliseconds;
 end;
 
-{ TSectionCacheTable }
-
-constructor TSectionCacheTable.Create(
-  const OwnsValues: Boolean;
-  const DefaultExpiresInMillis: Int64 = -1);
+procedure TValueNode.CheckSupportedTypeInfo(
+  const TypeInfo: PTypeInfo);
 begin
-  FSectionsCount := AVAILABLE_SECTIONS;
-
-  SetLength(FSections, FSectionsCount);
-
-  for var I := 0 to FSectionsCount - 1 do
-  begin
-    FSections[I] := TCacheTable.Create(
-        OwnsValues,
-        DefaultExpiresInMillis);
-  end;
+  if TypeInfo.Kind in [tkClass, tkInterface, tkClassRef, tkMRecord] then
+    raise ECacheException.CreateFmt('Unsupported cache value : %s.', [String(TypeInfo.Name)]);
 end;
 
-procedure TSectionCacheTable.Evict(
-  const Key: String);
-begin
-  FSections[0].Evict(Key);
-end;
+{$EndRegion 'TCacheTable.TValueNode' }
 
-function TSectionCacheTable.GetOrMiss<V>(
-  const Key: String;
-  out Value: V): Boolean;
-begin
-  Result := FSections[0].GetOrMiss<V>(Key, Value);
-end;
-
-function TSectionCacheTable.GetOrMiss<V>(
-  const Section, Key: String;
-  out Value: V): Boolean;
-var
-  lSectionIndex: Integer;
-begin
-  lSectionIndex := GetSectionIndex(Section);
-  Result := FSections[lSectionIndex].GetOrMiss<V>(Key, Value);
-end;
-
-procedure TSectionCacheTable.Invalidate(
-  const Section: String);
-var
-  lSectionIndex: Integer;
-begin
-  lSectionIndex := GetSectionIndex(Section);
-  FSections[lSectionIndex].Invalidate();
-end;
-
-procedure TSectionCacheTable.InvalidateAll();
-begin
-  for var I := 0 to FSectionsCount - 1 do
-    FSections[I].Invalidate();
-end;
-
-procedure TSectionCacheTable.Invalidate();
-begin
-  FSections[0].Invalidate();
-end;
-
-procedure TSectionCacheTable.Put<V>(
-  const Key: String;
-  const ExpiresInMillis: Int64;
-  const Value: V);
-begin
-  FSections[0].Put<V>(Key, ExpiresInMillis, Value);
-end;
-
-procedure TSectionCacheTable.Put<V>(
-  const Key: String;
-  const Value: V);
-begin
-  FSections[0].Put<V>(Key, Value);
-end;
-
-procedure TSectionCacheTable.Evict(
-  const Section, Key: String);
-var
-  lSectionIndex: Integer;
-begin
-  lSectionIndex := GetSectionIndex(Section);
-  FSections[lSectionIndex].Evict(Key);
-end;
-
-procedure TSectionCacheTable.Put<V>(
-  const Section, Key: String;
-  const ExpiresInMillis: Int64;
-  const Value: V);
-var
-  lSectionIndex: Integer;
-begin
-  lSectionIndex := GetSectionIndex(Section);
-  FSections[lSectionIndex].Put<V>(Key, ExpiresInMillis, Value);
-end;
-
-procedure TSectionCacheTable.Put<V>(
-  const Section, Key: String;
-  const Value: V);
-var
-  lSectionIndex: Integer;
-begin
-  lSectionIndex := GetSectionIndex(Section);
-  FSections[lSectionIndex].Put<V>(Key, Value);
-end;
-
-function TSectionCacheTable.GetSectionIndex(
-  const Section: String): Integer;
-begin
-  Result := 1 + (Abs(Section.GetHashCode()) mod (FSectionsCount - 1));
-end;
-
-destructor TSectionCacheTable.Destroy();
-begin
-  for var I := 0 to FSectionsCount - 1 do
-    FreeAndNil(FSections[I]);
-  inherited;
-end;
-
-{ TCacheManager }
+{$Region 'TCacheManager' }
 
 class constructor TCacheManager.Initialize();
+const
+  DEF_CAPACITY   = 128;
+  DEF_EXPIRES_IN = 1000 * 60 * 5;
 begin
-  FGlobalCacheTable := TSectionCacheTable.Create(
-      True,
-      Round(TTimeSpan.FromMinutes(2).TotalMilliseconds));
+  GlobalCacheTable := TCacheTable.Create(DEF_CAPACITY, DEF_EXPIRES_IN);
+end;
+
+class procedure TCacheManager.EvictAll();
+begin
+  GlobalCacheTable.EvictAll();
 end;
 
 class procedure TCacheManager.Evict(
   const Key: String);
 begin
-  FGlobalCacheTable.Evict(Key);
-end;
-
-class procedure TCacheManager.Evict(
-  const Section, Key: String);
-begin
-  FGlobalCacheTable.Evict(Section, Key);
-end;
-
-class function TCacheManager.GetOrMiss<V>(
-  const Section, Key: String;
-  out Value: V): Boolean;
-begin
-  Result := FGlobalCacheTable.GetOrMiss<V>(Section, Key, Value);
+  GlobalCacheTable.Evict(Key);
 end;
 
 class function TCacheManager.GetOrMiss<V>(
   const Key: String;
   out Value: V): Boolean;
 begin
-  Result := FGlobalCacheTable.GetOrMiss<V>(Key, Value);
-end;
-
-class procedure TCacheManager.Invalidate();
-begin
-  FGlobalCacheTable.Invalidate();
-end;
-
-class procedure TCacheManager.Invalidate(
-  const Section: String);
-begin
-  FGlobalCacheTable.Invalidate(Section);
-end;
-
-class procedure TCacheManager.InvalidateAll();
-begin
-  FGlobalCacheTable.InvalidateAll();
+  Result := GlobalCacheTable.GetOrMiss<V>(Key, Value);
 end;
 
 class procedure TCacheManager.Put<V>(
@@ -446,34 +411,182 @@ class procedure TCacheManager.Put<V>(
   const ExpiresInMillis: Int64;
   const Value: V);
 begin
-  FGlobalCacheTable.Put<V>(Key, ExpiresInMillis, Value);
+  GlobalCacheTable.Put<V>(Key, ExpiresInMillis, Value);
 end;
 
 class procedure TCacheManager.Put<V>(
   const Key: String;
   const Value: V);
 begin
-  FGlobalCacheTable.Put<V>(Key, Value);
-end;
-
-class procedure TCacheManager.Put<V>(
-  const Section, Key: String;
-  const Value: V);
-begin
-  FGlobalCacheTable.Put<V>(Section, Key, Value);
-end;
-
-class procedure TCacheManager.Put<V>(
-  const Section, Key: String;
-  const ExpiresInMillis: Int64;
-  const Value: V);
-begin
-  FGlobalCacheTable.Put<V>(Section, Key, ExpiresInMillis, Value);
+  GlobalCacheTable.Put<V>(Key, Value);
 end;
 
 class destructor TCacheManager.Unitialize();
 begin
-  FreeAndNil(FGlobalCacheTable);
+  FreeAndNil(GlobalCacheTable);
 end;
+
+{$EndRegion 'TCacheManager' }
+
+{$Region 'TCacheTable.TDoublyLinkedList' }
+
+constructor TCacheTable.TDoublyLinkedList.Create();
+begin
+  FHead := nil; FTail := nil;
+end;
+
+procedure TCacheTable.TDoublyLinkedList.AddToFront(
+  const ValueNode: PValueNode);
+begin
+  ValueNode.Previous := nil;
+  ValueNode.Next := FHead;
+
+  if FHead <> nil then
+    FHead.Previous := ValueNode;
+
+  FHead := ValueNode;
+
+  if FTail = nil then
+    FTail := ValueNode;
+end;
+
+procedure TCacheTable.TDoublyLinkedList.RemoveNode(
+  const ValueNode: PValueNode);
+begin
+  if ValueNode.Previous <> nil then
+    ValueNode.Previous.Next := ValueNode.Next
+  else
+    FHead := ValueNode.Next;
+
+  if ValueNode.Next <> nil then
+    ValueNode.Next.Previous := ValueNode.Previous
+  else
+    FTail := ValueNode.Previous;
+end;
+
+procedure TCacheTable.TDoublyLinkedList.MoveToFront(
+  const ValueNode: PValueNode);
+begin
+  if ValueNode = FHead then
+    Exit;
+
+  RemoveNode(ValueNode);
+  AddToFront(ValueNode);
+end;
+
+function TCacheTable.TDoublyLinkedList.RemoveEldest(
+  out Key: String): Boolean;
+var
+  lValueNode: PValueNode;
+begin
+  Key := EmptyStr;
+
+  if FTail = nil then
+  begin
+    Result := False;
+    Exit;
+  end;
+
+  lValueNode := FTail;
+  RemoveNode(lValueNode);
+
+  Key := lValueNode.Key;
+  Dispose(lValueNode);
+  Result := True;
+end;
+
+procedure TCacheTable.TDoublyLinkedList.Clear();
+var
+  lNext: PValueNode;
+  lCurrNode: PValueNode;
+begin
+  lCurrNode := FHead;
+
+  while lCurrNode <> nil do
+  begin
+    lNext := lCurrNode^.Next;
+    Dispose(lCurrNode);
+    lCurrNode := lNext;
+  end;
+
+  FHead := nil; FTail := nil;
+end;
+
+destructor TCacheTable.TDoublyLinkedList.Destroy();
+begin
+  Clear();
+  inherited;
+end;
+
+{$EndRegion 'TCacheTable.TDoublyLinkedList'}
+
+{$Region 'TCacheTable.TCachePairEnumerator' }
+
+constructor TCacheTable.TCachePairEnumerator.Create(Owner: TCacheTable);
+begin
+  FOwner := Owner;
+  FOwner.FRWSync.BeginRead();
+  FEnumerator := FOwner.FCacheDictionary.GetEnumerator();
+end;
+
+function TCacheTable.TCachePairEnumerator.DoGetCurrent(): TCachePair;
+begin
+  Result := GetCurrent();
+end;
+
+function TCacheTable.TCachePairEnumerator.DoMoveNext(): Boolean;
+begin
+  Result := MoveNext();
+end;
+
+function TCacheTable.TCachePairEnumerator.GetCurrent(): TCachePair;
+begin
+  Result := TCachePair.WithPair(FEnumerator.Current);
+end;
+
+function TCacheTable.TCachePairEnumerator.MoveNext(): Boolean;
+begin
+  Result := FEnumerator.MoveNext();
+end;
+
+destructor TCacheTable.TCachePairEnumerator.Destroy();
+begin
+  FEnumerator.Free();
+  FOwner.FRWSync.EndRead();
+  inherited;
+end;
+
+{$EndRegion 'TCacheTable.TCachePairEnumerator' }
+
+{$Region 'TCachePair' }
+
+class function TCachePair.WithPair(
+  const Pair: TPair<String, PValueNode>): TCachePair;
+begin
+  Result.FKey := Pair.Key;
+  Result.FValue := TCacheValue.From(Pair.Value);
+end;
+
+{$EndRegion 'TCachePair' }
+
+{$Region 'TCacheValue' }
+
+class function TCacheValue.From(
+  const ValueNode: PValueNode): TCacheValue;
+begin
+  Result.FValueNode := ValueNode;
+end;
+
+function TCacheValue.AsValue<V>: V;
+begin
+  Result := GetValueNodePointer().AsValue<V>();
+end;
+
+function TCacheValue.GetValueNodePointer(): PValueNode;
+begin
+  Result := FValueNode;
+end;
+
+{$EndRegion 'TCacheValue' }
 
 end.
