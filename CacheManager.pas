@@ -7,7 +7,6 @@ uses
   System.TypInfo,
   System.SysUtils,
   System.SyncObjs,
-  System.TimeSpan,
   System.Diagnostics,
   System.Generics.Defaults,
   System.Generics.Collections;
@@ -45,16 +44,17 @@ type
     end;
 
   //
-  // Enumeration helper types
+  // Enumeration helper types.
+  // Note: Values returned during enumeration hold raw pointers to internal
+  // nodes. They are valid only while the enumerator is alive (read lock held).
+  // Do not store TCacheValue instances beyond the enumeration scope.
   //
-  TCacheValue = packed record
+  TCacheValue = record
     strict private
       FValueNode: PValueNode;
+      function GetValueNodePointer(): PValueNode;
     public
       function AsValue<V>(): V;
-  private
-    function GetValueNodePointer: PValueNode;
-    public
       class function From(const ValueNode: PValueNode): TCacheValue; static;
     end;
 
@@ -77,11 +77,15 @@ type
   TCacheTable = class(TEnumerable<TCachePair>)
     strict private type
       //
-      // This class does not lock anything. It should be used internally
-      // with the IReadWriteSync synchronization blocks.
+      // This class uses a lightweight critical section to serialize
+      // pointer mutations. All structural changes (Add, Remove, Clear)
+      // must also be called under the external FRWSync write lock.
+      // MoveToFront can be safely called under a read lock since it
+      // only mutates list pointers (not the dictionary).
       //
       TDoublyLinkedList = class
         strict private
+          FLock: TCriticalSection;
           FHead, FTail: PValueNode;
         private
           procedure Clear();
@@ -150,7 +154,7 @@ type
       class function GetOrMiss<V>(const Key: String; out Value: V): Boolean; overload;
     public
       class constructor Initialize();
-      class destructor Unitialize();
+      class destructor Uninitialize();
     end;
 
 implementation
@@ -161,9 +165,10 @@ constructor TCacheTable.Create(
   const Capacity: Integer;
   const DefaultExpiresInMillis: Int64 = -1);
 begin
-  FCapacity := Capacity;
-  Assert(FCapacity >= 1, 'Capacity must be equals or greater than 1.');
+  if Capacity < 1 then
+    raise ECacheException.Create('Capacity must be greater than or equal to 1.');
 
+  FCapacity := Capacity;
   FDefaultExpiresInMillis := DefaultExpiresInMillis;
   FRWSync := TMultiReadExclusiveWriteSynchronizer.Create();
   FCacheLinkedList := TDoublyLinkedList.Create();
@@ -183,7 +188,7 @@ procedure TCacheTable.Put<V>(
   const Value: V);
 var
   lValueNode: PValueNode;
-  lExpiresInMillis: Integer;
+  lExpiresInMillis: Int64;
   lValue: TValue;
 begin
   lValueNode := nil;
@@ -191,6 +196,8 @@ begin
 
   if ExpiresInMillis <> -1 then
     lExpiresInMillis := ExpiresInMillis;
+
+  lValue := TValue.From<V>(Value);
 
   FRWSync.BeginWrite();
   try
@@ -200,8 +207,6 @@ begin
     //
     if FCacheDictionary.TryGetValue(Key, lValueNode) then
       HandleUnsafeRemove(lValueNode);
-
-    lValue := TValue.From<V>(Value);
 
     New(lValueNode);
     lValueNode.Initialize(Key, lValue, lExpiresInMillis);
@@ -232,7 +237,8 @@ begin
       Exit;
     end;
 
-    if lValueNode.ElapsedMillis < lValueNode.ExpiresInMillis then
+    if (lValueNode.ExpiresInMillis = -1) or
+       (lValueNode.ElapsedMillis < lValueNode.ExpiresInMillis) then
     begin
       FCacheLinkedList.MoveToFront(lValueNode);
       Value := lValueNode.AsValue<V>();
@@ -246,7 +252,13 @@ begin
   FRWSync.BeginWrite();
   try
     if FCacheDictionary.TryGetValue(Key, lValueNode) then
-      HandleUnsafeRemove(lValueNode);
+    begin
+      if (lValueNode.ExpiresInMillis <> -1) and
+         (lValueNode.ElapsedMillis >= lValueNode.ExpiresInMillis) then
+      begin
+        HandleUnsafeRemove(lValueNode);
+      end;
+    end;
   finally
     FRWSync.EndWrite();
   end;
@@ -341,6 +353,7 @@ var
   lValue: TValue;
   lVTypeInfo: PTypeInfo;
 begin
+  Result := Default(V);
   lVTypeInfo := TypeInfo(V);
 
   CheckSupportedTypeInfo(lVTypeInfo);
@@ -348,10 +361,7 @@ begin
   lValue := FValue;
 
   if (FValue.IsEmpty) or (lVTypeInfo = nil) then
-  begin
-    Result := Default(V);
     Exit;
-  end;
 
   if lVTypeInfo <> FValue.TypeInfo then
     lValue := FValue.Cast<V>(True);
@@ -371,7 +381,7 @@ begin
     raise ECacheException.CreateFmt('Unsupported cache value : %s.', [String(TypeInfo.Name)]);
 end;
 
-{$EndRegion 'TCacheTable.TValueNode' }
+{$EndRegion 'TValueNode' }
 
 {$Region 'TCacheManager' }
 
@@ -416,7 +426,7 @@ begin
   GlobalCacheTable.Put<V>(Key, Value);
 end;
 
-class destructor TCacheManager.Unitialize();
+class destructor TCacheManager.Uninitialize();
 begin
   FreeAndNil(GlobalCacheTable);
 end;
@@ -427,60 +437,102 @@ end;
 
 constructor TCacheTable.TDoublyLinkedList.Create();
 begin
-  FHead := nil; FTail := nil;
+  FLock := TCriticalSection.Create();
+  FHead := nil;
+  FTail := nil;
 end;
 
 procedure TCacheTable.TDoublyLinkedList.AddToFront(
   const ValueNode: PValueNode);
 begin
-  ValueNode.Previous := nil;
-  ValueNode.Next := FHead;
+  FLock.Enter();
+  try
+    ValueNode.Previous := nil;
+    ValueNode.Next := FHead;
 
-  if FHead <> nil then
-    FHead.Previous := ValueNode;
+    if Assigned(FHead) then
+      FHead.Previous := ValueNode;
 
-  FHead := ValueNode;
+    FHead := ValueNode;
 
-  if FTail = nil then
-    FTail := ValueNode;
+    if not Assigned(FTail) then
+      FTail := ValueNode;
+  finally
+    FLock.Leave();
+  end;
 end;
 
 procedure TCacheTable.TDoublyLinkedList.RemoveNode(
   const ValueNode: PValueNode);
 begin
-  if ValueNode.Previous <> nil then
-    ValueNode.Previous.Next := ValueNode.Next
-  else
-    FHead := ValueNode.Next;
+  FLock.Enter();
+  try
+    if Assigned(ValueNode.Previous) then
+      ValueNode.Previous.Next := ValueNode.Next
+    else
+      FHead := ValueNode.Next;
 
-  if ValueNode.Next <> nil then
-    ValueNode.Next.Previous := ValueNode.Previous
-  else
-    FTail := ValueNode.Previous;
+    if Assigned(ValueNode.Next) then
+      ValueNode.Next.Previous := ValueNode.Previous
+    else
+      FTail := ValueNode.Previous;
+  finally
+    FLock.Leave();
+  end;
 end;
 
 procedure TCacheTable.TDoublyLinkedList.MoveToFront(
   const ValueNode: PValueNode);
 begin
-  if ValueNode = FHead then
-    Exit;
+  FLock.Enter();
+  try
+    if ValueNode = FHead then
+      Exit;
 
-  RemoveNode(ValueNode);
-  AddToFront(ValueNode);
+    // Remove from current position
+    if Assigned(ValueNode.Previous) then
+      ValueNode.Previous.Next := ValueNode.Next
+    else
+      FHead := ValueNode.Next;
+
+    if Assigned(ValueNode.Next) then
+      ValueNode.Next.Previous := ValueNode.Previous
+    else
+      FTail := ValueNode.Previous;
+
+    // Add to front
+    ValueNode.Previous := nil;
+    ValueNode.Next := FHead;
+
+    if Assigned(FHead) then
+      FHead.Previous := ValueNode;
+
+    FHead := ValueNode;
+
+    if not Assigned(FTail) then
+      FTail := ValueNode;
+  finally
+    FLock.Leave();
+  end;
 end;
 
 function TCacheTable.TDoublyLinkedList.TryGetEldestNode(
   out ValueNode: PValueNode): Boolean;
 begin
-  if FTail = nil then
-  begin
-    Result := False;
-    ValueNode := nil;
-    Exit;
-  end;
+  FLock.Enter();
+  try
+    if not Assigned(FTail) then
+    begin
+      Result := False;
+      ValueNode := nil;
+      Exit;
+    end;
 
-  ValueNode := FTail;
-  Result := True;
+    ValueNode := FTail;
+    Result := True;
+  finally
+    FLock.Leave();
+  end;
 end;
 
 procedure TCacheTable.TDoublyLinkedList.Clear();
@@ -488,21 +540,27 @@ var
   lNext: PValueNode;
   lCurrNode: PValueNode;
 begin
-  lCurrNode := FHead;
+  FLock.Enter();
+  try
+    lCurrNode := FHead;
+    while Assigned(lCurrNode) do
+    begin
+      lNext := lCurrNode^.Next;
+      Dispose(lCurrNode);
+      lCurrNode := lNext;
+    end;
 
-  while lCurrNode <> nil do
-  begin
-    lNext := lCurrNode^.Next;
-    Dispose(lCurrNode);
-    lCurrNode := lNext;
+    FHead := nil;
+    FTail := nil;
+  finally
+    FLock.Leave();
   end;
-
-  FHead := nil; FTail := nil;
 end;
 
 destructor TCacheTable.TDoublyLinkedList.Destroy();
 begin
   Clear();
+  FreeAndNil(FLock);
   inherited;
 end;
 
