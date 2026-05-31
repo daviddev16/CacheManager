@@ -4,15 +4,35 @@ interface
 
 uses
   System.Rtti,
+  System.JSON,
   System.TypInfo,
   System.SysUtils,
   System.SyncObjs,
+  System.IOUtils,
   System.Diagnostics,
   System.Generics.Defaults,
   System.Generics.Collections;
 
 type
   ECacheException = class(Exception);
+
+  TCacheStatistics = class
+    strict private type
+      PValueNodeStat = ^TValueNodeStat;
+      TValueNodeStat = record
+        Miss, Hit: Integer;
+      end;
+    strict private
+      class var Lock: TCriticalSection;
+      class var HitCountMap: TDictionary<String, TValueNodeStat>;
+      class procedure ModifyStat(const Key: String; Proc: TProc<PValueNodeStat>);
+    public
+      class constructor Initialize();
+      class destructor Unitialize();
+      class procedure Hit(const Key: String);
+      class procedure Miss(const Key: String);
+      class procedure Dump();
+    end;
 
   //
   // Record used to store the cache key-value
@@ -233,6 +253,7 @@ begin
   try
     if not FCacheDictionary.TryGetValue(Key, lValueNode) then
     begin
+      TCacheStatistics.Miss(Key);
       Value := Default(V);
       Exit;
     end;
@@ -240,11 +261,14 @@ begin
     if (lValueNode.ExpiresInMillis = -1) or
        (lValueNode.ElapsedMillis < lValueNode.ExpiresInMillis) then
     begin
+      TCacheStatistics.Hit(Key);
       FCacheLinkedList.MoveToFront(lValueNode);
       Value := lValueNode.AsValue<V>();
       Result := True;
       Exit;
     end;
+
+    TCacheStatistics.Miss(Key);
   finally
     FRWSync.EndRead();
   end;
@@ -634,5 +658,87 @@ begin
 end;
 
 {$EndRegion 'TCacheValue' }
+
+{$Region 'TCacheStatistics'}
+
+class constructor TCacheStatistics.Initialize();
+begin
+  Lock := TCriticalSection.Create();
+  HitCountMap := TDictionary<String, TValueNodeStat>.Create();
+end;
+
+class procedure TCacheStatistics.Miss(const Key: String);
+begin
+writeln('miss');
+  ModifyStat(Key, procedure (Stat: PValueNodeStat) begin
+    Inc(Stat^.Miss);
+  end);
+end;
+
+class procedure TCacheStatistics.Hit(const Key: String);
+begin
+writeln('hit');
+  ModifyStat(Key, procedure (Stat: PValueNodeStat) begin
+    Inc(Stat^.Hit);
+  end);
+end;
+
+class procedure TCacheStatistics.ModifyStat(
+  const Key: String;
+  Proc: TProc<PValueNodeStat>);
+{$IFDEF ENABLE_CACHE_STATISTICS}
+var
+  lValueNodeStat: TValueNodeStat;
+begin
+  if not Assigned(HitCountMap) then
+    Exit;
+
+  lValueNodeStat.Miss := 0;
+  lValueNodeStat.Hit := 0;
+
+  Lock.Acquire();
+  try
+    HitCountMap.TryGetValue(Key, lValueNodeStat);
+    Proc(@lValueNodeStat);
+    HitCountMap.AddOrSetValue(Key, lValueNodeStat);
+  finally
+    Lock.Release();
+  end;
+end;
+{$ELSE}
+begin end;
+{$ENDIF}
+
+class procedure TCacheStatistics.Dump();
+var
+  lCacheDumpPath: String;
+  lJSONObject: TJSONObject;
+begin
+  if not Assigned(HitCountMap) then
+    Exit;
+  lCacheDumpPath := ExtractFilePath(ParamStr(0));
+  lCacheDumpPath := IncludeTrailingPathDelimiter(lCacheDumpPath);
+  lCacheDumpPath := lCacheDumpPath + 'cache_dump_' + FormatDateTime('dd_nnss', Now()) + '.json';
+  lJSONObject := TJSONObject.Create();
+  try
+    for var CacheEntry in HitCountMap do
+    begin
+      lJSONObject.AddPair(CacheEntry.Key + '_Hit', CacheEntry.Value.Hit.ToString());
+      lJSONObject.AddPair(CacheEntry.Key + '_Miss', CacheEntry.Value.Miss.ToString());
+    end;
+
+    TFile.WriteAllText(lCacheDumpPath, lJSONObject.ToJSON());
+  finally
+    lJSONObject.Free();
+  end;
+end;
+
+class destructor TCacheStatistics.Unitialize();
+begin
+  FreeAndNil(HitCountMap);
+  FreeAndNil(Lock);
+end;
+
+{$EndRegion 'TCacheStatistics'}
 
 end.
